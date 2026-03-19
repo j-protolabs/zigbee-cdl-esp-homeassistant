@@ -1,0 +1,242 @@
+# ============================================================
+#  Home Assistant Package: Diesel Heater Controller  v2.0
+#  File: packages/diesel_heater.yaml
+#
+#  Requires: ZHA integration with the ESP32-C6 paired.
+#  After pairing rename the device to "diesel_heater" in ZHA.
+#  Add to secrets.yaml:  diesel_heater_ieee: "xx:xx:xx:xx:xx:xx:xx:xx"
+# ============================================================
+
+# ── Input helpers ─────────────────────────────────────────────
+input_number:
+
+  heater_pump_hz:
+    name: "Heater Pump Frequency"
+    min: 10          # 1.0 Hz  (raw × 10)
+    max: 65          # 6.5 Hz
+    step: 1
+    unit_of_measurement: "×10 (÷10 = Hz)"
+    icon: mdi:fuel
+    initial: 35      # 3.5 Hz default
+
+  heater_air_setpoint:
+    name: "Air Heat Setpoint"
+    min: 5
+    max: 35
+    step: 0.5
+    unit_of_measurement: "°C"
+    icon: mdi:thermometer
+    initial: 20.0
+
+  hot_water_target_temp:
+    name: "Hot Water Target Temp"
+    min: 40
+    max: 65
+    step: 1
+    unit_of_measurement: "°C"
+    icon: mdi:water-thermometer
+    initial: 60.0
+
+input_select:
+  heater_mode_select:
+    name: "Heater Mode"
+    options:
+      - "Off"
+      - "Air Heat"
+      - "Hot Water"
+    icon: mdi:radiator
+
+input_boolean:
+  heater_thermostat_enabled:
+    name: "Air Thermostat Enabled"
+    icon: mdi:thermostat
+
+  hot_water_routine_active:
+    name: "Heat Hot Water Now"
+    icon: mdi:water-boiler
+
+input_text:
+  heater_pre_hw_mode:
+    name: "Heater Pre-HW Mode (internal)"
+    initial: ""
+    max: 20
+
+# ── Template sensors ──────────────────────────────────────────
+template:
+  - sensor:
+
+      # ── Run state (decoded from raw uint8) ──────────────────
+      - name: "Heater Run State"
+        unique_id: heater_run_state_text
+        icon: mdi:state-machine
+        state: >
+          {% set s = states('sensor.diesel_heater_run_state') | int(0) %}
+          {% if   s == 0 %}Off
+          {% elif s == 1 %}Startup
+          {% elif s == 2 %}Preheat
+          {% elif s == 3 %}Ignition
+          {% elif s == 4 %}Ignition retry
+          {% elif s == 5 %}Stabilising
+          {% elif s == 6 %}Running
+          {% elif s == 7 %}Cooling down
+          {% elif s == 8 %}Fan cooldown
+          {% elif s == 9 %}Shutting down
+          {% elif s == 255 %}FAULT
+          {% else %}Unknown ({{ s }}){% endif %}
+
+      # ── Error code (decoded) ─────────────────────────────────
+      - name: "Heater Error"
+        unique_id: heater_error_text
+        icon: mdi:alert-circle
+        state: >
+          {% set e = states('sensor.diesel_heater_error_code') | int(0) %}
+          {% if   e == 0  %}None
+          {% elif e == 1  %}No ignition
+          {% elif e == 2  %}Overheat
+          {% elif e == 3  %}Under-voltage
+          {% elif e == 4  %}Over-voltage
+          {% elif e == 5  %}Glow plug fault
+          {% elif e == 6  %}Pump fault
+          {% elif e == 7  %}Fan fault
+          {% elif e == 8  %}Sensor fault
+          {% elif e == 9  %}Flame lost
+          {% elif e == 10 %}Low voltage (running)
+          {% else %}Unknown ({{ e }}){% endif %}
+
+      # ── Supply voltage ───────────────────────────────────────
+      - name: "Heater Supply Voltage"
+        unique_id: heater_supply_voltage
+        unit_of_measurement: "V"
+        device_class: voltage
+        state_class: measurement
+        icon: mdi:battery-charging
+        state: >
+          {{ (states('sensor.diesel_heater_supply_voltage') | float(0) / 10) | round(1) }}
+
+      # ── Body / outlet temperature (from heater) ──────────────
+      - name: "Heater Body Temp"
+        unique_id: heater_body_temp
+        unit_of_measurement: "°C"
+        device_class: temperature
+        state_class: measurement
+        state: >
+          {{ (states('sensor.diesel_heater_body_temp') | float(0) / 100) | round(1) }}
+
+      # ── DS18B20 heat exchanger ───────────────────────────────
+      - name: "Heat Exchanger Temp"
+        unique_id: heat_exchanger_temp
+        unit_of_measurement: "°C"
+        device_class: temperature
+        state_class: measurement
+        state: >
+          {{ (states('sensor.diesel_heater_temp_heat_exchanger') | float(0) / 100) | round(2) }}
+
+      # ── DS18B20 hot water tank ───────────────────────────────
+      - name: "Hot Water Tank Temp"
+        unique_id: hot_water_tank_temp
+        unit_of_measurement: "°C"
+        device_class: temperature
+        state_class: measurement
+        state: >
+          {{ (states('sensor.diesel_heater_temp_hot_water') | float(0) / 100) | round(2) }}
+
+      # ── Actual pump Hz (from heater telemetry) ───────────────
+      - name: "Pump Hz Actual"
+        unique_id: pump_hz_actual
+        unit_of_measurement: "Hz"
+        icon: mdi:sine-wave
+        state_class: measurement
+        state: >
+          {{ (states('sensor.diesel_heater_pump_hz_actual') | float(0) / 10) | round(1) }}
+
+      # ── Desired pump Hz (echo from heater) ───────────────────
+      - name: "Pump Hz Desired"
+        unique_id: pump_hz_desired
+        unit_of_measurement: "Hz"
+        icon: mdi:sine-wave
+        state_class: measurement
+        state: >
+          {{ (states('sensor.diesel_heater_pump_hz_desired') | float(0) / 10) | round(1) }}
+
+      # ── Target pump Hz from HA slider (human readable) ───────
+      - name: "Pump Hz Target"
+        unique_id: pump_hz_target
+        unit_of_measurement: "Hz"
+        icon: mdi:tune
+        state: >
+          {{ (states('input_number.heater_pump_hz') | float(35) / 10) | round(1) }}
+
+      # ── Glow plug state ──────────────────────────────────────
+      - name: "Glow Plug State"
+        unique_id: glow_plug_state_text
+        icon: mdi:heating-coil
+        state: >
+          {% set g = states('sensor.diesel_heater_glow_plug_state') | int(0) %}
+          {% if g == 0 %}Off
+          {% elif g == 1 %}Preheat
+          {% elif g == 2 %}On (ignition)
+          {% else %}Unknown{% endif %}
+
+      # ── Cooldown readable ────────────────────────────────────
+      - name: "Heater Cooldown"
+        unique_id: heater_cooldown_readable
+        icon: mdi:timer-sand
+        state: >
+          {% set s = states('sensor.diesel_heater_cooldown_remaining') | int(0) %}
+          {% if s > 0 %}{{ s }}s remaining
+          {% else %}Ready{% endif %}
+
+      # ── Approximate heat output (kW estimate) ────────────────
+      - name: "Heater Heat Output (est)"
+        unique_id: heater_heat_output_est
+        unit_of_measurement: "kW"
+        icon: mdi:fire
+        state: >
+          {% set hz = states('sensor.pump_hz_actual') | float(0) %}
+          {{ [(hz * 0.77) | round(1), 0] | max }}
+        # Rough linear approximation: 1Hz ≈ 0.77kW for a 5kW unit
+
+  # ── Binary sensors ──────────────────────────────────────────
+  - binary_sensor:
+
+      - name: "Heater Running"
+        unique_id: heater_running
+        device_class: running
+        state: >
+          {{ states('sensor.diesel_heater_run_state') | int(0) in [1,2,3,4,5,6] }}
+
+      - name: "Flame Detected"
+        unique_id: heater_flame_detected
+        device_class: heat
+        state: >
+          {{ states('sensor.diesel_heater_flame_detected') | int(0) == 1 }}
+
+      - name: "Heater Has Error"
+        unique_id: heater_has_error
+        device_class: problem
+        state: >
+          {{ states('sensor.diesel_heater_error_code') | int(0) != 0 }}
+
+      - name: "Heater Emergency Stop"
+        unique_id: heater_emergency_stop
+        device_class: problem
+        state: >
+          {{ states('sensor.diesel_heater_emergency_stop') | int(0) == 1 }}
+
+      - name: "Heater Cooldown Active"
+        unique_id: heater_cooldown_active
+        state: >
+          {{ states('sensor.diesel_heater_cooldown_remaining') | int(0) > 0 }}
+
+      - name: "Heater Serial Frame OK"
+        unique_id: heater_frame_valid
+        device_class: connectivity
+        state: >
+          {{ states('sensor.diesel_heater_frame_valid') | int(0) == 1 }}
+
+      - name: "Supply Voltage OK"
+        unique_id: heater_voltage_ok
+        device_class: power
+        state: >
+          {% set v = states('sensor.heater_supply_voltage') | float(0) %}
+          {{ v >= 9.5 and v <= 15.5 and v > 0 }}

@@ -1,0 +1,165 @@
+title: Diesel Heater Control
+path: diesel-heater
+icon: mdi:radiator
+cards:
+
+  # ── Status banner ──────────────────────────────────────────
+  - type: markdown
+    content: >
+      ## 🔥 Diesel Heater Controller
+
+      **State:** {{ states('sensor.heater_run_state') }}
+      {% if is_state('binary_sensor.flame_detected', 'on') %} 🔥{% endif %}
+      &nbsp;|&nbsp;
+      **Mode:** {{ states('input_select.heater_mode_select') }}
+      &nbsp;|&nbsp;
+      **Comms:** {% if is_state('binary_sensor.heater_serial_frame_ok','on') %}✅ OK{% else %}❌ LOST{% endif %}
+
+      {% if is_state('binary_sensor.heater_emergency_stop','on') %}
+      ### 🚨 EMERGENCY STOP ACTIVE
+      Reason: **{{ states('sensor.diesel_heater_emergency_reason') }}**
+      {% elif is_state('binary_sensor.heater_cooldown_active','on') %}
+      ### 🕐 COOLDOWN: {{ states('sensor.heater_cooldown') }}
+      {% elif is_state('binary_sensor.heater_has_error','on') %}
+      ### ⚠️ FAULT: {{ states('sensor.heater_error') }}
+      {% endif %}
+
+  # ── Temperature gauges ─────────────────────────────────────
+  - type: horizontal-stack
+    cards:
+      - type: gauge
+        entity: sensor.heat_exchanger_temp
+        name: Heat Exchanger
+        unit: "°C"
+        min: 0
+        max: 100
+        needle: true
+        severity:
+          green: 0
+          yellow: 60
+          red: 82
+
+      - type: gauge
+        entity: sensor.hot_water_tank_temp
+        name: Hot Water Tank
+        unit: "°C"
+        min: 0
+        max: 80
+        needle: true
+        severity:
+          green: 0
+          yellow: 55
+          red: 68
+
+      - type: gauge
+        entity: sensor.heater_body_temp
+        name: Heater Body
+        unit: "°C"
+        min: 0
+        max: 100
+        needle: true
+        severity:
+          green: 0
+          yellow: 60
+          red: 80
+
+  # ── Pump Hz live readout ────────────────────────────────────
+  - type: horizontal-stack
+    cards:
+      - type: entity
+        entity: sensor.pump_hz_target
+        name: Target Hz
+        icon: mdi:tune
+
+      - type: entity
+        entity: sensor.pump_hz_desired
+        name: Heater Desired
+        icon: mdi:sine-wave
+
+      - type: entity
+        entity: sensor.pump_hz_actual
+        name: Actual Running
+        icon: mdi:check-circle
+
+      - type: entity
+        entity: sensor.heater_heat_output_est
+        name: Est. Output
+        icon: mdi:fire
+
+  # ── Live telemetry ─────────────────────────────────────────
+  - type: entities
+    title: Live Telemetry
+    entities:
+      - entity: sensor.heater_run_state
+        name: Run State
+        icon: mdi:state-machine
+      - entity: sensor.heater_error
+        name: Error
+        icon: mdi:alert-circle
+      - entity: sensor.heater_supply_voltage
+        name: Supply Voltage
+      - entity: sensor.diesel_heater_fan_speed_rpm
+        name: Fan Speed (RPM)
+        icon: mdi:fan
+      - entity: sensor.glow_plug_state
+        name: Glow Plug
+        icon: mdi:heating-coil
+      - entity: binary_sensor.flame_detected
+        name: Flame Detected
+        icon: mdi:fire
+      - entity: binary_sensor.supply_voltage_ok
+        name: Voltage OK
+
+  # ── Controls ───────────────────────────────────────────────
+  - type: entities
+    title: Controls
+    entities:
+      - entity: input_select.heater_mode_select
+        name: Mode
+      - type: divider
+      - entity: input_number.heater_pump_hz
+        name: "Pump Hz (raw ×10: 10=1.0Hz, 35=3.5Hz, 65=6.5Hz)"
+      - type: divider
+      - entity: input_boolean.heater_thermostat_enabled
+        name: Air Thermostat
+      - entity: input_number.heater_air_setpoint
+        name: Air Setpoint
+      - type: divider
+      - entity: input_boolean.hot_water_routine_active
+        name: Heat Hot Water Now
+      - entity: input_number.hot_water_target_temp
+        name: Hot Water Target
+
+  # ── Cooldown indicator ─────────────────────────────────────
+  - type: conditional
+    conditions:
+      - entity: binary_sensor.heater_cooldown_active
+        state: "on"
+    card:
+      type: markdown
+      content: >
+        ### 🕐 Cooldown in progress
+        **{{ states('sensor.heater_cooldown') }}**
+        The heater cannot start until the 500s cooldown completes.
+        Fan is still running to cool the unit.
+
+  # ── Emergency clear button (only shown when active) ────────
+  - type: conditional
+    conditions:
+      - entity: binary_sensor.heater_emergency_stop
+        state: "on"
+    card:
+      type: button
+      name: "Clear Emergency Stop (after inspection)"
+      icon: mdi:shield-check
+      tap_action:
+        action: call-service
+        service: zha.issue_zigbee_cluster_command
+        service_data:
+          ieee: !secret diesel_heater_ieee
+          endpoint_id: 1
+          cluster_id: 64512
+          cluster_type: in
+          command: 4
+          command_type: server
+          params: {}

@@ -1,0 +1,439 @@
+# ============================================================
+#  Home Assistant Automations: Diesel Heater v2.0
+#  File: automations/diesel_heater_automations.yaml
+#
+#  IEEE address must be in secrets.yaml:
+#    diesel_heater_ieee: "xx:xx:xx:xx:xx:xx:xx:xx"
+#
+#  ZHA custom cluster commands:
+#    cluster_id: 64512   (0xFC00)
+#    CMD 0x00 = SetMode         param1 = mode uint8
+#    CMD 0x01 = SetPumpHzRaw    param1 = Hz×10 uint8
+#    CMD 0x02 = SetAirSetpoint  param1 = °C×100 int16
+#    CMD 0x03 = SetServo        param1 = degrees uint8
+#    CMD 0x04 = ClearEmergency  no params
+# ============================================================
+
+# ════════════════════════════════════════════════════════════
+#  1.  Mode selector → heater
+# ════════════════════════════════════════════════════════════
+- id: heater_mode_change
+  alias: "Heater: Mode selector → device"
+  mode: single
+  trigger:
+    - platform: state
+      entity_id: input_select.heater_mode_select
+  condition:
+    - condition: state
+      entity_id: binary_sensor.heater_cooldown_active
+      state: "off"
+    - condition: state
+      entity_id: binary_sensor.heater_emergency_stop
+      state: "off"
+  action:
+    - variables:
+        mode_val: >
+          {% set m = states('input_select.heater_mode_select') %}
+          {% if m == 'Off' %}0
+          {% elif m == 'Air Heat' %}1
+          {% elif m == 'Hot Water' %}2
+          {% else %}0{% endif %}
+    - service: zha.issue_zigbee_cluster_command
+      data:
+        ieee: !secret diesel_heater_ieee
+        endpoint_id: 1
+        cluster_id: 64512
+        cluster_type: in
+        command: 0              # CMD_SET_MODE
+        command_type: server
+        params:
+          param1: "{{ mode_val }}"
+    - service: notify.persistent_notification
+      data:
+        title: "Heater Mode"
+        message: "Mode set to {{ states('input_select.heater_mode_select') }}"
+
+# ════════════════════════════════════════════════════════════
+#  2.  Pump Hz slider → heater
+#      Slider range 10–65 (1.0–6.5 Hz, stored ×10)
+# ════════════════════════════════════════════════════════════
+- id: heater_pump_hz_change
+  alias: "Heater: Pump Hz slider → device"
+  mode: single
+  trigger:
+    - platform: state
+      entity_id: input_number.heater_pump_hz
+  condition:
+    - condition: state
+      entity_id: binary_sensor.heater_running
+      state: "on"
+    - condition: state
+      entity_id: binary_sensor.heater_cooldown_active
+      state: "off"
+  action:
+    - variables:
+        raw_val: "{{ states('input_number.heater_pump_hz') | int(35) }}"
+    - service: zha.issue_zigbee_cluster_command
+      data:
+        ieee: !secret diesel_heater_ieee
+        endpoint_id: 1
+        cluster_id: 64512
+        cluster_type: in
+        command: 1              # CMD_SET_PUMP_HZ_RAW
+        command_type: server
+        params:
+          param1: "{{ raw_val }}"
+    - service: notify.persistent_notification
+      data:
+        title: "Heater Pump Hz"
+        message: "Pump Hz set to {{ (raw_val | float / 10) | round(1) }} Hz"
+
+# ════════════════════════════════════════════════════════════
+#  3.  Air setpoint slider → heater
+# ════════════════════════════════════════════════════════════
+- id: heater_setpoint_change
+  alias: "Heater: Air setpoint → device"
+  mode: single
+  trigger:
+    - platform: state
+      entity_id: input_number.heater_air_setpoint
+  action:
+    - variables:
+        sp_raw: "{{ (states('input_number.heater_air_setpoint') | float * 100) | int }}"
+    - service: zha.issue_zigbee_cluster_command
+      data:
+        ieee: !secret diesel_heater_ieee
+        endpoint_id: 1
+        cluster_id: 64512
+        cluster_type: in
+        command: 2              # CMD_SET_AIR_SETPOINT
+        command_type: server
+        params:
+          param1: "{{ sp_raw }}"
+
+# ════════════════════════════════════════════════════════════
+#  4a. Air Heat Thermostat – room above setpoint
+#      Reduce pump Hz to minimum (heater keeps running, just ticks over)
+# ════════════════════════════════════════════════════════════
+- id: heater_thermostat_warm
+  alias: "Heater Thermostat: Room warm – min pump Hz"
+  mode: single
+  trigger:
+    - platform: template
+      value_template: >
+        {{ states('sensor.living_room_temperature') | float(0) >=
+           states('input_number.heater_air_setpoint') | float(20) + 0.5 }}
+  condition:
+    - condition: state
+      entity_id: input_boolean.heater_thermostat_enabled
+      state: "on"
+    - condition: state
+      entity_id: input_select.heater_mode_select
+      state: "Air Heat"
+    - condition: state
+      entity_id: binary_sensor.heater_running
+      state: "on"
+  action:
+    # Set pump to minimum: 1.0 Hz (raw=10)
+    - service: zha.issue_zigbee_cluster_command
+      data:
+        ieee: !secret diesel_heater_ieee
+        endpoint_id: 1
+        cluster_id: 64512
+        cluster_type: in
+        command: 1
+        command_type: server
+        params:
+          param1: 10    # 1.0 Hz minimum fire
+
+# ════════════════════════════════════════════════════════════
+#  4b. Air Heat Thermostat – room below setpoint
+#      Ramp pump Hz back to slider value
+# ════════════════════════════════════════════════════════════
+- id: heater_thermostat_cold
+  alias: "Heater Thermostat: Room cold – ramp pump Hz"
+  mode: single
+  trigger:
+    - platform: template
+      value_template: >
+        {{ states('sensor.living_room_temperature') | float(0) <=
+           states('input_number.heater_air_setpoint') | float(20) - 0.5 }}
+  condition:
+    - condition: state
+      entity_id: input_boolean.heater_thermostat_enabled
+      state: "on"
+    - condition: state
+      entity_id: input_select.heater_mode_select
+      state: "Air Heat"
+    - condition: state
+      entity_id: binary_sensor.heater_cooldown_active
+      state: "off"
+    - condition: state
+      entity_id: binary_sensor.heater_emergency_stop
+      state: "off"
+  action:
+    # If heater is off, start it first
+    - if:
+        - condition: state
+          entity_id: binary_sensor.heater_running
+          state: "off"
+      then:
+        - service: input_select.select_option
+          target: { entity_id: input_select.heater_mode_select }
+          data: { option: "Air Heat" }
+        - delay: { seconds: 3 }
+
+    # Restore target pump Hz from slider
+    - service: zha.issue_zigbee_cluster_command
+      data:
+        ieee: !secret diesel_heater_ieee
+        endpoint_id: 1
+        cluster_id: 64512
+        cluster_type: in
+        command: 1
+        command_type: server
+        params:
+          param1: "{{ states('input_number.heater_pump_hz') | int(35) }}"
+
+# ════════════════════════════════════════════════════════════
+#  5.  Hot Water Routine
+#
+#  Flow:
+#   ① Save current mode
+#   ② Switch to Hot Water (servo moves to heat-exchanger)
+#   ③ Set pump to hot-water speed (raw=55, 5.5 Hz)
+#   ④ Wait until hot water DS18B20 ≥ target temp (default 60°C)
+#   ⑤ Heater stop (500s cooldown starts in firmware)
+#   ⑥ After cooldown clears: restore previous mode if Air Heat
+# ════════════════════════════════════════════════════════════
+- id: hot_water_routine_start
+  alias: "Hot Water: Routine start"
+  mode: single
+  trigger:
+    - platform: state
+      entity_id: input_boolean.hot_water_routine_active
+      to: "on"
+  condition:
+    - condition: state
+      entity_id: binary_sensor.heater_cooldown_active
+      state: "off"
+    - condition: state
+      entity_id: binary_sensor.heater_emergency_stop
+      state: "off"
+  action:
+    # ① Save current mode
+    - service: input_text.set_value
+      target: { entity_id: input_text.heater_pre_hw_mode }
+      data: { value: "{{ states('input_select.heater_mode_select') }}" }
+      continue_on_error: true
+
+    # ② Switch to hot water mode
+    - service: input_select.select_option
+      target: { entity_id: input_select.heater_mode_select }
+      data: { option: "Hot Water" }
+
+    # ③ Set pump Hz to hot-water speed (5.5 Hz = raw 55)
+    - delay: { seconds: 3 }
+    - service: zha.issue_zigbee_cluster_command
+      data:
+        ieee: !secret diesel_heater_ieee
+        endpoint_id: 1
+        cluster_id: 64512
+        cluster_type: in
+        command: 1
+        command_type: server
+        params:
+          param1: 55    # 5.5 Hz for hot water heating
+
+    # ④ Wait for hot water tank to reach target temperature
+    - wait_template: >
+        {{ states('sensor.hot_water_tank_temp') | float(0) >=
+           states('input_number.hot_water_target_temp') | float(60) }}
+      timeout: { hours: 2 }
+      continue_on_timeout: true
+
+    # Notify result
+    - choose:
+        - conditions:
+            - condition: template
+              value_template: "{{ wait.completed }}"
+          sequence:
+            - service: notify.notify
+              data:
+                title: "🔥 Hot Water Ready"
+                message: >
+                  Hot water reached {{ states('sensor.hot_water_tank_temp') }}°C.
+                  Heater shutting down – 500s cooldown starting.
+        default:
+          - service: notify.notify
+            data:
+              title: "Hot Water – Timeout"
+              message: >
+                Hot water target not reached after 2 hours
+                (current: {{ states('sensor.hot_water_tank_temp') }}°C).
+                Shutting down.
+
+    # ⑤ Stop heater (triggers 500s cooldown in firmware)
+    - service: input_select.select_option
+      target: { entity_id: input_select.heater_mode_select }
+      data: { option: "Off" }
+
+    - service: input_boolean.turn_off
+      target: { entity_id: input_boolean.hot_water_routine_active }
+
+# ════════════════════════════════════════════════════════════
+#  6.  Restore previous mode after hot water cooldown
+# ════════════════════════════════════════════════════════════
+- id: hot_water_restore_after_cooldown
+  alias: "Hot Water: Restore mode after cooldown"
+  mode: single
+  trigger:
+    - platform: state
+      entity_id: binary_sensor.heater_cooldown_active
+      to: "off"
+  condition:
+    - condition: template
+      value_template: >
+        {{ states('input_text.heater_pre_hw_mode') == 'Air Heat' }}
+  action:
+    - service: input_select.select_option
+      target: { entity_id: input_select.heater_mode_select }
+      data: { option: "{{ states('input_text.heater_pre_hw_mode') }}" }
+    - service: input_text.set_value
+      target: { entity_id: input_text.heater_pre_hw_mode }
+      data: { value: "" }
+    - service: notify.notify
+      data:
+        title: "Heater"
+        message: "Cooldown complete – returned to Air Heat mode."
+
+# ════════════════════════════════════════════════════════════
+#  7.  Block restart during cooldown or emergency
+# ════════════════════════════════════════════════════════════
+- id: heater_block_restart_cooldown
+  alias: "Heater: Block restart during cooldown/emergency"
+  mode: single
+  trigger:
+    - platform: state
+      entity_id: input_select.heater_mode_select
+      to:
+        - "Air Heat"
+        - "Hot Water"
+  condition:
+    - condition: or
+      conditions:
+        - condition: state
+          entity_id: binary_sensor.heater_cooldown_active
+          state: "on"
+        - condition: state
+          entity_id: binary_sensor.heater_emergency_stop
+          state: "on"
+  action:
+    - service: input_select.select_option
+      target: { entity_id: input_select.heater_mode_select }
+      data: { option: "Off" }
+    - service: notify.persistent_notification
+      data:
+        title: "⛔ Heater Locked"
+        message: >
+          {% if is_state('binary_sensor.heater_emergency_stop', 'on') %}
+            Emergency stop active: {{ states('sensor.diesel_heater_emergency_reason') }}
+            Clear the fault via the dashboard before restarting.
+          {% else %}
+            Cooldown in progress – {{ states('sensor.heater_cooldown') }}.
+            Heater will be available after cooldown completes.
+          {% endif %}
+
+# ════════════════════════════════════════════════════════════
+#  8.  Heater fault notification  (error code ≠ 0)
+# ════════════════════════════════════════════════════════════
+- id: heater_fault_notify
+  alias: "Heater: Fault code alert"
+  mode: single
+  trigger:
+    - platform: state
+      entity_id: binary_sensor.heater_has_error
+      to: "on"
+  action:
+    - service: notify.notify
+      data:
+        title: "⚠️ Heater Fault"
+        message: >
+          Error: {{ states('sensor.heater_error') }}
+          Run state: {{ states('sensor.heater_run_state') }}
+          Supply: {{ states('sensor.heater_supply_voltage') }} V
+          Body temp: {{ states('sensor.heater_body_temp') }}°C
+          Fan: {{ states('sensor.diesel_heater_fan_speed_rpm') }} RPM
+
+# ════════════════════════════════════════════════════════════
+#  9.  Emergency stop notification
+# ════════════════════════════════════════════════════════════
+- id: heater_emergency_notify
+  alias: "Heater: Emergency stop alert"
+  mode: single
+  trigger:
+    - platform: state
+      entity_id: binary_sensor.heater_emergency_stop
+      to: "on"
+  action:
+    - service: notify.notify
+      data:
+        title: "🚨 Heater Emergency Stop"
+        message: >
+          EMERGENCY STOP triggered!
+          Reason: {{ states('sensor.diesel_heater_emergency_reason') }}
+          HX temp:   {{ states('sensor.heat_exchanger_temp') }}°C
+          HW temp:   {{ states('sensor.hot_water_tank_temp') }}°C
+          Body temp: {{ states('sensor.heater_body_temp') }}°C
+          Supply:    {{ states('sensor.heater_supply_voltage') }}V
+          Error:     {{ states('sensor.heater_error') }}
+          Manual inspection required before clearing fault.
+
+# ════════════════════════════════════════════════════════════
+#  10. HA-side belt-and-suspenders overtemp shutoff
+# ════════════════════════════════════════════════════════════
+- id: heater_ha_overtemp
+  alias: "Heater: HA overtemp safety shutoff"
+  mode: single
+  trigger:
+    - platform: numeric_state
+      entity_id: sensor.heat_exchanger_temp
+      above: 85
+    - platform: numeric_state
+      entity_id: sensor.hot_water_tank_temp
+      above: 70
+  action:
+    - service: input_select.select_option
+      target: { entity_id: input_select.heater_mode_select }
+      data: { option: "Off" }
+    - service: notify.notify
+      data:
+        title: "🌡️ Heater Overtemp (HA Safety)"
+        message: >
+          HA safety shutoff: HX={{ states('sensor.heat_exchanger_temp') }}°C
+          HW={{ states('sensor.hot_water_tank_temp') }}°C
+
+# ════════════════════════════════════════════════════════════
+#  11. Serial comms lost alert
+#      If frame_valid goes false while heater should be running
+# ════════════════════════════════════════════════════════════
+- id: heater_comms_lost
+  alias: "Heater: Serial comms lost"
+  mode: single
+  trigger:
+    - platform: state
+      entity_id: binary_sensor.heater_serial_frame_ok
+      to: "off"
+      for: { seconds: 15 }
+  condition:
+    - condition: state
+      entity_id: binary_sensor.heater_running
+      state: "on"
+  action:
+    - service: notify.notify
+      data:
+        title: "⚡ Heater Comms Lost"
+        message: >
+          Serial communication with heater lost for 15s while heater was running.
+          Check wiring and bus enable circuit.
+          Heater run state last known: {{ states('sensor.heater_run_state') }}
